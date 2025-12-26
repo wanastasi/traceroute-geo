@@ -1,0 +1,5 @@
+ts	hop	ip	rtt_ms	asn	org	country	region	city	lat	lon	flags
+2025-01-01T00:00:00	1	10.0.0.1	1							private_ip
+2025-01-01T00:00:01	2	1.1.1.1	10	AS13335	Cloudflare, Inc.	US	CA	San Francisco	37.7749	-122.4194	
+2025-01-01T00:00:02	3	2.2.2.2		AS64512	ExampleNet	US	TX	Dallas	32.7767	-96.7970	icmp_loss
+2025-01-01T00:00:03	4	3.3.3.3	30	AS65500	OtherNet	CA	ON	Ottawa	45.4215	-75.6972	
