@@ -1,13 +1,47 @@
 #!/usr/bin/env bash
-set -euo pipefail
-
 # Run traceroute, geo-enrich hops via ipinfo.io, and emit TSV with cache.
+# Designed to be minimally OS-specific; traceroute binary/flags are overridable.
+set -euo pipefail
+# Preserve tabs/newlines in reads; functions needing space splitting set IFS locally.
+IFS=$'\n\t'
+
 # Arguments: <target hostname/IP>
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib.sh"
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") <target>
+
+Environment overrides:
+  TRACEROUTE_CMD   Command to run instead of 'traceroute'
+  TR_OPTS          Additional traceroute options (default: -q 1 -w 1 -m 20 -n)
+EOF
+}
+
+[ $# -eq 1 ] || { usage >&2; exit 1; }
+
 TARGET="$1"
 CACHE_DIR="cache"
 CACHE_FILE="${CACHE_DIR}/ip.tsv"
 
-mkdir -p "$CACHE_DIR"
+ensure_dirs "$CACHE_DIR" "tmp"
+require_cmd curl
+
+TR_CMD="$(choose_traceroute)"
+
+# Build traceroute options as an array to avoid IFS issues.
+if [[ -n "${TR_OPTS:-}" ]]; then
+  IFS=' ' read -r -a TR_OPTS_ARR <<< "$TR_OPTS"
+else
+  if [[ "$TR_CMD" == "tracepath" ]]; then
+    # tracepath has different flags; keep it simple and numeric output if supported.
+    TR_OPTS_ARR=(-n)
+  else
+    TR_OPTS_ARR=(-q 1 -w 1 -m 20 -n)
+  fi
+fi
 
 # Initialize cache if missing (stores basic ipinfo lookups).
 if [[ ! -f "$CACHE_FILE" ]]; then
@@ -19,53 +53,65 @@ echo -e "ts\thop\tip\trtt_ms\tasn\torg\tcountry\tregion\tcity\tlat\tlon\tflags"
 
 hop=0
 
-# Single-probe traceroute to limit noise; process each hop line-by-line.
-traceroute -q 1 -w 1 -m 20 -n "$TARGET" | while read -r line; do
-  hop=$((hop+1))
-  ts=$(date +"%Y-%m-%dT%H:%M:%S")
+# Run traceroute (or provided trace input) and process each hop line-by-line.
+if [[ -n "${TRACE_INPUT_FILE:-}" ]]; then
+  TRACE_CMD=(cat "$TRACE_INPUT_FILE")
+else
+  TRACE_CMD=("$TR_CMD" "${TR_OPTS_ARR[@]}" "$TARGET")
+fi
 
-  ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^[0-9]+\./) {print $i; exit}}')
-
-  [[ -z "$ip" ]] && continue
-  
-  # Extract RTT FIRST (may be empty, but must be defined)
-  rtt=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($(i+1)=="ms") {print $i; exit}}')
-
-  # Short-circuit private / bogon IPs (DO NOT geo-enrich or cache via ipinfo)
-  # Detect private / bogon IPs early
-  if [[ "$ip" =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|127\.|169\.254\.) ]]; then
-    echo -e "$ip\t\t\t\t\t\t\t" >> "$CACHE_FILE"
-    echo -e "$ts\t$hop\t$ip\t$rtt\t\t\t\t\t\t\tprivate_ip"
+"${TRACE_CMD[@]}" | while read -r line; do
+  # Skip traceroute banner lines
+  if [[ "$line" =~ ^traceroute\ to ]]; then
     continue
   fi
 
-  # Recompute RTT in case earlier branch continued.
-  rtt=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($(i+1)=="ms") {print $i; exit}}')
+  # Hop number: prefer first token if numeric, else increment.
+  first_token=$(echo "$line" | awk '{print $1}')
+  if [[ "$first_token" =~ ^[0-9]+$ ]]; then
+    hop=$first_token
+  else
+    hop=$((hop+1))
+  fi
 
-  flags=""
+  ts=$(date +"%Y-%m-%dT%H:%M:%S")
 
-  # Private IP detection
-  if [[ "$ip" =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.) ]]; then
-    flags="private_ip"
+  ip=$(echo "$line" | parse_first_ip)
+
+  # Treat lines with no IP (e.g., "* * *") as loss rows.
+  if [[ -z "$ip" ]]; then
+    flags="icmp_loss"
+    echo -e "$ts\t$hop\t\t\t\t\t\t\t\t\t\t$flags"
+    continue
+  fi
+
+  # Extract RTT and annotations
+  rtt=$(echo "$line" | parse_first_rtt)
+  flag_ann=$(echo "$line" | parse_flags_from_line)
+  flags="${flag_ann}"
+
+  # Private / bogon IPs are not enriched.
+  if is_private_ip "$ip"; then
+    flags="${flags:+$flags,}private_ip"
+    echo -e "$ts\t$hop\t$ip\t$rtt\t\t\t\t\t\t\t$flags"
+    continue
   fi
 
   # Cache lookup for IP enrichment to avoid hammering ipinfo.
   row=$(awk -F'\t' -v ip="$ip" '$1 == ip {print; exit}' "$CACHE_FILE")
 
-
   if [[ -z "$row" ]]; then
-    # Cache miss: fetch all ipinfo fields.
-    asn=$(curl -s "ipinfo.io/$ip/org" | awk '{print $1}')
-    org=$(curl -s "ipinfo.io/$ip/org" | sed 's/^AS[0-9]* //')
-    country=$(curl -s "ipinfo.io/$ip/country")
-    region=$(curl -s "ipinfo.io/$ip/region")
-    city=$(curl -s "ipinfo.io/$ip/city")
-    loc=$(curl -s "ipinfo.io/$ip/loc")
+    json=$(fetch_ipinfo_json "$ip" || true)
 
-    lat="${loc%,*}"
-    lon="${loc#*,}"
-
-    echo -e "$ip\t$asn\t$org\t$country\t$region\t$city\t$lat\t$lon" >> "$CACHE_FILE"
+    # Handle lookup failures gracefully.
+    if [[ -z "$json" ]] || [[ "$json" == *"Rate limit"* ]]; then
+      flags="${flags:+$flags,}lookup_error"
+      asn=""; org=""; country=""; region=""; city=""; lat=""; lon=""
+    else
+      parsed=$(parse_ipinfo_json "$json")
+      IFS=$'\t' read -r asn org country region city lat lon <<< "$parsed"
+      echo -e "$ip\t$asn\t$org\t$country\t$region\t$city\t$lat\t$lon" >> "$CACHE_FILE"
+    fi
   else
     IFS=$'\t' read -r _ asn org country region city lat lon <<< "$row"
   fi

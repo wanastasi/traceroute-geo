@@ -37,11 +37,19 @@ END {
   print "Route Summary"
   print "-------------"
   print "Total hops:", hops
-  print "RTT min / avg / max:", min " / " (rtt_sum/rtt_count) " / " max " ms"
+  if (rtt_count > 0) {
+    print "RTT min / avg / max:", min " / " (rtt_sum/rtt_count) " / " max " ms"
+  } else {
+    print "RTT min / avg / max:", "n/a (no RTTs)"
+  }
   print "Largest RTT jump:", max_delta " ms at hop", delta_hop
   print "ASN handoffs:", handoffs
   print "Unique ASNs:", length(asn)
-  print "ICMP loss:", loss " hops (" (loss/hops*100) "%)"
+  if (hops > 0) {
+    print "ICMP loss:", loss " hops (" (loss/hops*100) "%)"
+  } else {
+    print "ICMP loss: n/a"
+  }
   print "Countries:"
   for (c in country) print "  -", c
 }
