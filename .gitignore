@@ -1,0 +1,10 @@
+## Ignore temporary trace outputs but keep placeholder to track empty dir
+tmp/*
+!tmp/.gitkeep
+
+# macOS
+.DS_Store
+
+# Editor dirs
+.idea/
+.vscode/
